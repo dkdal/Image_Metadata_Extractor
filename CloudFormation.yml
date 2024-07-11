@@ -1,0 +1,182 @@
+Parameters:
+  BucketName:
+    Type: String
+    Default: my-metadata-s3-bucket
+  SecretKeyName:
+    Type: String
+    Default: MetaDataSecrets
+  LambdaUploadFuncName:
+    Type: String
+    Default: UploadLambdaFunction
+  LambdaRetrieveFuncName:
+    Type: String
+    Default: RetrieveLambdaFunction
+  SnsTopicName:
+    Type: String
+    Default: MetaDataSns
+
+Resources:
+  # AWS Secret Manager
+  MySecret:
+    Type: "AWS::SecretsManager::Secret"
+    Properties:
+      Name: !Ref SecretKeyName
+      Description: "5409 cloud project secret"
+      SecretString: !Sub |
+        {"bucket_name":"${BucketName}","sns_arn":"${MySNSTopic.Arn}"}
+
+  # S3 Bucket
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+
+  S3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3Bucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action:
+              - "s3:GetObject"
+            Effect: Allow
+            Resource: !Join
+              - ""
+              - - "arn:aws:s3:::"
+                - !Ref S3Bucket
+                - /*
+            Principal: "*"
+
+  # SNS Creation
+  MySNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: "Meta Data Email Notification"
+      TopicName: !Ref SnsTopicName
+
+  # Lambda functions
+  UploadLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: upload.handler
+      Code:
+        S3Bucket: codebucket5409
+        S3Key: upload.zip
+      Runtime: nodejs14.x
+      Environment:
+        Variables:
+          S3_BUCKET_NAME: !Ref BucketName
+          SNS_TOPIC_ARN: !GetAtt MySNSTopic.Arn
+      Role: "arn:aws:iam::851725527345:role/LabRole"
+
+  RetrieveLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: retrieve.handler
+      Code:
+        S3Bucket: codebucket5409
+        S3Key: retrieve.zip
+      Runtime: nodejs14.x
+      Environment:
+        Variables:
+          S3_BUCKET_NAME: !Ref BucketName
+      Role: "arn:aws:iam::851725527345:role/LabRole"
+
+  # API Gateway
+  MyApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: MyApiGateway
+
+  UploadApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref MyApiGateway
+      ParentId: !GetAtt MyApiGateway.RootResourceId
+      PathPart: upload
+
+  RetrieveApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref MyApiGateway
+      ParentId: !GetAtt MyApiGateway.RootResourceId
+      PathPart: retrieve
+
+  UploadApiMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref MyApiGateway
+      ResourceId: !Ref UploadApiResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UploadLambdaFunction.Arn}/invocations"
+
+  RetrieveApiMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref MyApiGateway
+      ResourceId: !Ref RetrieveApiResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${RetrieveLambdaFunction.Arn}/invocations"
+
+  MyApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - UploadApiMethod
+      - RetrieveApiMethod
+    Properties:
+      RestApiId: !Ref MyApiGateway
+
+  MyApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      StageName: Prod
+      RestApiId: !Ref MyApiGateway
+      DeploymentId: !Ref MyApiDeployment
+
+  # Step Function
+  StepFunction:
+    Type: "AWS::StepFunctions::StateMachine"
+    Properties:
+      StateMachineName: "MyStepFunction"
+      RoleArn: "arn:aws:iam::851725527345:role/LabRole"
+      DefinitionString: |
+        {
+          "StartAt": "CheckImageUpload",
+          "States": {
+            "CheckImageUpload": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.imageUploaded",
+                  "BooleanEquals": true,
+                  "Next": "RetrieveImageMetadata"
+                }
+              ],
+              "Default": "UploadImage"
+            },
+            "UploadImage": {
+              "Type": "Task",
+              "Resource": "arn:aws:lambda:${AWS::Region}:851725527345:function:${LambdaUploadFuncName}",
+              "End": true
+            },
+            "RetrieveImageMetadata": {
+              "Type": "Task",
+              "Resource": "arn:aws:lambda:${AWS::Region}:851725527345:function:${LambdaRetrieveFuncName}",
+              "End": true
+            }
+          }
+        }
